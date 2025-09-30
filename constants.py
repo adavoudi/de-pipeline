@@ -83,6 +83,8 @@ create table if not exists order_items (
 
 EU_COUNTRIES = ["DE","FR","ES","IT","NL","BE","AT","SE","DK","PL"]
 CATEGORIES = ["Home", "Accessories", "Electronics", "Apparel", "Beauty"]
+CUSTOMER_COUNT = 500
+PRODUCT_COUNT = 30
 CHANNEL_PRIORS = {
     "google": 0.38,
     "facebook": 0.27,
@@ -100,12 +102,6 @@ MARKETING_CAMPAIGNS = {
 STATUSES = ["created","paid","shipped","cancelled","refunded"]
 
 # --- Clickstream generator ---
-PRODUCT_IDS = [
-    "p_1001", "p_1002", "p_1003", "p_1004", "p_1005",
-    "p_2001", "p_2002", "p_2003",
-    "p_3001", "p_3002",
-]
-CUSTOMER_IDS = [f"c_{i:03d}" for i in range(1, 501)]
 ANON_RATE = 0.45
 MEAN_VIEWS_PER_SESSION = 2.4
 P_ADD_TO_CART = 0.30

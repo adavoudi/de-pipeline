@@ -16,7 +16,6 @@ Requires: mysql-connector-python (only when using --apply)
 import argparse
 import os
 import random
-import string
 import sys
 import time
 from dataclasses import dataclass
@@ -25,16 +24,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from constants import (
-    CATEGORIES,
     CHANNEL_PRIORS,
     CURRENCY,
-    EU_COUNTRIES,
+    CUSTOMER_COUNT,
     MARKETING_CAMPAIGNS as CAMPAIGNS,
+    PRODUCT_COUNT,
     SCHEMA_SQL,
     STATUSES,
 )
 
-from utils import parse_date, weighted_choice
+from utils import DEFAULT_SEED, generate_customers, generate_products, parse_date, weighted_choice
+
+random.seed(DEFAULT_SEED)
 
 # ---------- Optional MySQL connector ----------
 
@@ -77,34 +78,6 @@ def pick_campaign(channel: str) -> Optional[str]:
 
 def sample_customer_id(pop: Sequence[str]) -> str:
     return random.choice(pop)
-
-def sample_name():
-    first = random.choice(["Alex","Sam","Chris","Taylor","Jordan","Jamie","Robin","Avery","Kai","Riley","Max","Nico","Dana","Quinn","Noa"])
-    last = random.choice(["Müller","Schmidt","Fischer","Weber","Schneider","Becker","Wagner","Hansen","Dubois","Rossi","Santos","Costa","Nowak","Kowalski","Ivanov"])
-    return f"{first} {last}"
-
-def slugify(s: str) -> str:
-    return "".join(ch.lower() if ch.isalnum() else "-" for ch in s).strip("-")
-
-def sample_email(full_name: str, i: int):
-    base = slugify(full_name.replace(" ", "."))
-    domain = random.choice(["example.com","shopmail.eu","email.test"])
-    return f"{base}.{i}@{domain}"
-
-def sample_product(pid: int) -> Tuple[str, str, str, float]:
-    category = random.choice(CATEGORIES)
-    name = f"{category} Item {pid}"
-    product_id = f"p_{1000+pid}"
-    # category-dependent price bands (EUR)
-    base = {
-        "Home": (15, 120),
-        "Accessories": (10, 80),
-        "Electronics": (30, 400),
-        "Apparel": (12, 150),
-        "Beauty": (8, 90),
-    }[category]
-    price = round(random.uniform(*base), 2)
-    return product_id, name, category, price
 
 def sample_items(product_ids_prices: Dict[str, float]) -> List[Tuple[str,int,float,float]]:
     """Return list of (product_id, qty, unit_price, line_amount)."""
@@ -218,10 +191,8 @@ def cmd_reprice(apply: bool, dsn: Optional[str], outfile: Optional[Path],
         conn.close()
     else:
         # Synthesize a small catalog if not applying (for SQL preview)
-        from random import randint
-        for i in range(1, 31):
-            pid, _name, _cat, price = sample_product(i)
-            products.append((pid, price, True))
+        for product in generate_products(PRODUCT_COUNT):
+            products.append((product["product_id"], product["price"], True))
 
     if only_active:
         products = [p for p in products if p[2]]
@@ -231,7 +202,7 @@ def cmd_reprice(apply: bool, dsn: Optional[str], outfile: Optional[Path],
 
     # Build update plan (timestamp, product_id, old_price, new_price)
     plan: List[Tuple[str, str, float, float]] = []
-    rng = random.Random()
+    rng = random.Random(DEFAULT_SEED)
 
     if backfill_start and backfill_end:
         start = parse_date(backfill_start)
@@ -291,32 +262,28 @@ def cmd_init(apply: bool, dsn: Optional[str], outfile: Optional[Path]) -> None:
     statements = [x.strip() for x in SCHEMA_SQL.strip().split(";\n\n") if x.strip()]
     out_or_apply(statements, apply, dsn, outfile)
 
-def cmd_seed(customers: int, products: int, apply: bool, dsn: Optional[str], outfile: Optional[Path]) -> None:
+def cmd_seed(apply: bool, dsn: Optional[str], outfile: Optional[Path]) -> None:
     statements: List[str] = []
 
     # Customers
-    cust_ids: List[str] = []
-    for i in range(1, customers + 1):
-        cid = f"c_{i:03d}"
-        cust_ids.append(cid)
-        full_name = sample_name()
-        email = sample_email(full_name, i)
-        country = random.choice(EU_COUNTRIES)
-        opt_in = "TRUE" if random.random() < 0.35 else "FALSE"
-        created = iso_ts(now_utc() - timedelta(days=random.randint(1, 120)))
+    customer_records = generate_customers(CUSTOMER_COUNT, reference_time=now_utc())
+    for record in customer_records:
+        opt_in = "TRUE" if record["marketing_opt_in"] else "FALSE"
+        created = iso_ts(record["created_at"])
         statements.append(
-            f"insert into customers (customer_id,email,full_name,country_code,marketing_opt_in,created_at) "
-            f"values ('{cid}','{email}','{full_name}','{country}',{opt_in},'{created}')"
+            "insert into customers (customer_id,email,full_name,country_code,marketing_opt_in,created_at) "
+            f"values ('{record['customer_id']}','{record['email']}','{record['full_name']}',"
+            f"'{record['country_code']}',{opt_in},'{created}')"
         )
 
     # Products
-    product_price_map: Dict[str,float] = {}
-    for i in range(1, products + 1):
-        pid, name, category, price = sample_product(i)
-        product_price_map[pid] = price
+    product_records = generate_products(PRODUCT_COUNT)
+    updated_at = iso_ts(now_utc())
+    for product in product_records:
         statements.append(
             f"insert into products (product_id,name,category,price,currency,is_active,updated_at) "
-            f"values ('{pid}','{name}','{category}',{price:.2f},'{CURRENCY}',TRUE,'{iso_ts(now_utc())}')"
+            f"values ('{product['product_id']}','{product['name']}','{product['category']}',"
+            f"{product['price']:.2f},'{CURRENCY}',TRUE,'{updated_at}')"
         )
 
     out_or_apply(statements, apply, dsn, outfile)
@@ -342,12 +309,12 @@ def cmd_orders(count: int, apply: bool, dsn: Optional[str], outfile: Optional[Pa
         conn.close()
     else:
         # Synthesize IDs (align with seed defaults)
-        customer_ids = [f"c_{i:03d}" for i in range(1, 501)]
+        synthesized_customers = generate_customers(CUSTOMER_COUNT)
+        customer_ids = [c["customer_id"] for c in synthesized_customers]
         # simple default country for tax calc when printing SQL
-        cust_country = {cid: random.choice(EU_COUNTRIES) for cid in customer_ids}
-        for i in range(1, 31):
-            pid, _, _, price = sample_product(i)
-            product_ids_prices[pid] = price
+        cust_country = {c["customer_id"]: c["country_code"] for c in synthesized_customers}
+        for product in generate_products(PRODUCT_COUNT):
+            product_ids_prices[product["product_id"]] = product["price"]
 
     if not product_ids_prices or not customer_ids:
         raise RuntimeError("No products or customers found. Run 'seed' first (or provide --apply with existing data).")
@@ -491,8 +458,6 @@ def main():
     p_init = sub.add_parser("init", help="Create tables")
     # seed
     p_seed = sub.add_parser("seed", help="Insert customers & products")
-    p_seed.add_argument("--customers", type=int, default=500, help="Number of customers (default 500)")
-    p_seed.add_argument("--products", type=int, default=30, help="Number of products (default 30)")
     # orders
     p_orders = sub.add_parser("orders", help="Generate orders & order_items")
     p_orders.add_argument("--count", type=int, default=200, help="Number of orders to create")
@@ -508,7 +473,7 @@ def main():
     if args.cmd == "init":
         cmd_init(args.apply, args.dsn, args.outfile)
     elif args.cmd == "seed":
-        cmd_seed(args.customers, args.products, args.apply, args.dsn, args.outfile)
+        cmd_seed(args.apply, args.dsn, args.outfile)
     elif args.cmd == "orders":
         cmd_orders(args.count, args.apply, args.dsn, args.outfile, args.min_lines, args.max_lines, args.backfill_days)
     elif args.cmd == "stream":

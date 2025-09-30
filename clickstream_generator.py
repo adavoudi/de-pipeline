@@ -34,22 +34,28 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional
 
 from constants import (
     ANON_RATE,
     CHANNEL_PRIORS,
     CURRENCY,
-    CUSTOMER_IDS,
+    CUSTOMER_COUNT,
     MARKETING_CAMPAIGNS as CAMPAIGNS,
-    MAX_SESSION_SECONDS,
     MEAN_VIEWS_PER_SESSION,
     P_ADD_TO_CART,
     P_CHECKOUT_FROM_ATC,
-    PRODUCT_IDS,
+    PRODUCT_COUNT,
 )
 
-from utils import weighted_choice
+from utils import DEFAULT_SEED, generate_customers, generate_products, weighted_choice
+
+random.seed(DEFAULT_SEED)
+
+CUSTOMER_RECORDS = generate_customers(CUSTOMER_COUNT)
+CUSTOMER_IDS = [c["customer_id"] for c in CUSTOMER_RECORDS]
+PRODUCT_CATALOG = generate_products(PRODUCT_COUNT)
+PRODUCT_IDS = [p["product_id"] for p in PRODUCT_CATALOG]
 
 # Optional Kafka support (lazy import so the script works without it)
 def _maybe_load_kafka():
@@ -167,7 +173,7 @@ def generate_events_stream(total_events: Optional[int], eps: float, output, kafk
     kafka_cfg: (brokers, topic) or None
     jitter: +/- fraction to vary eps each second (e.g., 0.25 = ±25%)
     """
-    random.seed()  # system entropy
+    random.seed(DEFAULT_SEED)
     emitted = 0
     # slightly staggered start times per session
     base_time = datetime.now(timezone.utc)
