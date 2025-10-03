@@ -31,12 +31,20 @@ from constants import (
     MARKETING_CAMPAIGNS as CAMPAIGNS,
     PRODUCT_COUNT,
     SCHEMA_SQL,
-    STATUSES,
 )
 
 from utils import DEFAULT_SEED, generate_customers, generate_products, parse_date, weighted_choice
 
 random.seed(DEFAULT_SEED)
+
+STATUS_TRANSITIONS = {
+    "created": ("paid",),
+    "paid": ("shipped", "shipped","shipped", "shipped", "shipped", "shipped", "cancelled"),  # repeat shipped to bias toward fulfillment
+    "cancelled": ("refunded",),
+}
+TERMINAL_STATUSES: Tuple[str, ...] = tuple(sorted({"shipped", "refunded"}))
+ADVANCE_EARLIEST_CREATED_SQL = "now() - interval 10 hour"
+ADVANCE_LATEST_CREATED_SQL = "now() - interval 5 minute"
 
 # ---------- Optional MySQL connector ----------
 
@@ -107,18 +115,45 @@ def shipping_fee_for_subtotal(subtotal: float) -> float:
         return 2.99
     return 4.99
 
-def status_from_total(total: float) -> str:
-    r = random.random()
-    if r < 0.70:
-        return "paid"
-    elif r < 0.85:
-        return "shipped"
-    elif r < 0.92:
-        return "created"
-    elif r < 0.97:
-        return "cancelled"
+def status_from_total(_total: float) -> str:
+    return "created"
+
+
+def advance_open_orders(cur, max_updates: int) -> int:
+    if max_updates <= 0:
+        return 0
+
+    time_window_clause = (
+        f"created_at < {ADVANCE_LATEST_CREATED_SQL}"
+    )
+    if TERMINAL_STATUSES:
+        placeholders = ",".join(["%s"] * len(TERMINAL_STATUSES))
+        query = (
+            "select order_id, status, created_at < (now() - interval 5 hour) as is_earliest from orders "
+            f"where status not in ({placeholders}) and {time_window_clause} "
+            "order by is_earliest desc, rand() limit %s"
+        )
+        params = (*TERMINAL_STATUSES, max_updates)
     else:
-        return "refunded"
+        query = (
+            "select order_id, status from orders "
+            f"where {time_window_clause} order by rand() limit %s"
+        )
+        params = (max_updates,)
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    advanced = 0
+    for order_id, status, _ in rows:
+        transitions = STATUS_TRANSITIONS.get(str(status))
+        if not transitions:
+            continue
+        next_state = random.choice(transitions)
+        cur.execute(
+            "update orders set status=%s, updated_at=now() where order_id=%s",
+            (next_state, order_id),
+        )
+        advanced += 1
+    return advanced
 
 # ---------- SQL emit / apply helpers ----------
 
@@ -375,12 +410,12 @@ def cmd_orders(count: int, apply: bool, dsn: Optional[str], outfile: Optional[Pa
         created_at = iso_ts(now_utc())
         order_columns = (
             "order_id,customer_id,order_ts,status,currency,"
-            "subtotal,tax,shipping_fee,total_amount,channel,campaign_id,created_at"
+            "subtotal,tax,shipping_fee,total_amount,channel,campaign_id,created_at,updated_at"
         )
         order_values = (
             f"'{order_id}','{cid}','{iso_ts(order_ts)}','{status}','{CURRENCY}',"
             f"{subtotal:.2f},{tax:.2f},{shipping_fee:.2f},{total_amount:.2f},"
-            f"'{channel}',{campaign_value},'{created_at}'"
+            f"'{channel}',{campaign_value},'{created_at}','{created_at}'"
         )
         statements.append(
             f"insert into orders ({order_columns}) values ({order_values})"
@@ -432,11 +467,26 @@ def cmd_stream(eps: float, apply: bool, dsn: Optional[str]) -> None:
                 shipping_fee = round(shipping_fee_for_subtotal(subtotal), 2)
                 total_amount = round(subtotal + tax + shipping_fee, 2)
                 status = status_from_total(total_amount)
+                created_ts = datetime.utcnow()
 
                 cur.execute(
-                    "insert into orders (order_id,customer_id,order_ts,status,currency,subtotal,tax,shipping_fee,total_amount,channel,campaign_id,created_at) "
-                    "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())",
-                    (order_id, cid, order_ts, status, CURRENCY, subtotal, tax, shipping_fee, total_amount, channel, campaign_id)
+                    "insert into orders (order_id,customer_id,order_ts,status,currency,subtotal,tax,shipping_fee,total_amount,channel,campaign_id,created_at,updated_at) "
+                    "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        order_id,
+                        cid,
+                        order_ts,
+                        status,
+                        CURRENCY,
+                        subtotal,
+                        tax,
+                        shipping_fee,
+                        total_amount,
+                        channel,
+                        campaign_id,
+                        created_ts,
+                        created_ts,
+                    )
                 )
                 for pid, qty, unit_price, line_amount in items:
                     cur.execute(
@@ -445,6 +495,11 @@ def cmd_stream(eps: float, apply: bool, dsn: Optional[str]) -> None:
                     )
                 conn.commit()
                 print(f"Inserted order {order_id} ({len(items)} lines) total={total_amount:.2f} {CURRENCY}")
+
+            progressed = advance_open_orders(cur, random.randint(0, 3))
+            if progressed:
+                conn.commit()
+                print(f"Advanced {progressed} open order(s) to the next status")
             time.sleep(1.0)
     except KeyboardInterrupt:
         print("Stopping stream...")
@@ -509,11 +564,26 @@ def cmd_live(
                 shipping_fee = round(shipping_fee_for_subtotal(subtotal), 2)
                 total_amount = round(subtotal + tax + shipping_fee, 2)
                 status = status_from_total(total_amount)
+                created_ts = datetime.utcnow()
 
                 cur.execute(
-                    "insert into orders (order_id,customer_id,order_ts,status,currency,subtotal,tax,shipping_fee,total_amount,channel,campaign_id,created_at) "
-                    "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())",
-                    (order_id, cid, order_ts, status, CURRENCY, subtotal, tax, shipping_fee, total_amount, channel, campaign_id),
+                    "insert into orders (order_id,customer_id,order_ts,status,currency,subtotal,tax,shipping_fee,total_amount,channel,campaign_id,created_at,updated_at) "
+                    "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        order_id,
+                        cid,
+                        order_ts,
+                        status,
+                        CURRENCY,
+                        subtotal,
+                        tax,
+                        shipping_fee,
+                        total_amount,
+                        channel,
+                        campaign_id,
+                        created_ts,
+                        created_ts,
+                    ),
                 )
                 for pid, qty, unit_price, line_amount in items:
                     cur.execute(
@@ -522,6 +592,11 @@ def cmd_live(
                     )
                 conn.commit()
                 print(f"Inserted order {order_id} ({len(items)} lines) total={total_amount:.2f} {CURRENCY}")
+
+            progressed = advance_open_orders(cur, random.randint(0, 3))
+            if progressed:
+                conn.commit()
+                print(f"Advanced {progressed} open order(s) to the next status")
 
             now = time.monotonic()
             if (

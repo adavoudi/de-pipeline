@@ -63,6 +63,7 @@ create table if not exists orders (
   channel varchar(20),
   campaign_id varchar(50),
   created_at timestamp not null default current_timestamp,
+  updated_at timestamp not null default current_timestamp,
   constraint fk_orders_customer foreign key (customer_id) references customers(customer_id),
   constraint chk_status check (status in ('created','paid','shipped','cancelled','refunded'))
 );
