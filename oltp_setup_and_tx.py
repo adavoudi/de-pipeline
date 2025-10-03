@@ -7,9 +7,10 @@ Implements the minimal e-commerce schema and generates realistic transactional d
 - seed: insert customers & products
 - orders: create orders & order_items with consistent currency math
 - stream: continuously create orders
+- live: ensure schema + seed, stream orders, periodically reprice products
 
 By default prints SQL. Use --apply with a DSN to execute against MySQL.
-DSN format: "host=localhost user=root password=secret database=shop port=3306"
+DSN format: "host=localhost user=root password=password database=shop port=3306"
 Requires: mysql-connector-python (only when using --apply)
 """
 
@@ -150,6 +151,26 @@ def out_or_apply(statements: List[str], apply: bool, dsn: Optional[str], outfile
             print(f"Wrote SQL to {outfile}")
         else:
             sys.stdout.write(sql_blob)
+
+
+def ensure_schema_and_seed(dsn: str) -> None:
+    """Create tables if missing and seed base data when tables are empty."""
+    # Always run init; the statements use IF NOT EXISTS so this is idempotent.
+    cmd_init(apply=True, dsn=dsn, outfile=None)
+
+    conn = _maybe_get_conn(dsn)
+    try:
+        cur = conn.cursor()
+        cur.execute("select count(*) from customers")
+        customer_count = cur.fetchone()[0]
+        cur.execute("select count(*) from products")
+        product_count = cur.fetchone()[0]
+        cur.close()
+    finally:
+        conn.close()
+
+    if customer_count == 0 or product_count == 0:
+        cmd_seed(apply=True, dsn=dsn, outfile=None)
 
 # ---------- Commands ----------
 
@@ -431,6 +452,107 @@ def cmd_stream(eps: float, apply: bool, dsn: Optional[str]) -> None:
         cur.close()
         conn.close()
 
+
+def cmd_live(
+    eps: float,
+    reprice_chance: float,
+    reprice_cooldown: float,
+    reprice_count: int,
+    reprice_pct_min: float,
+    reprice_pct_max: float,
+    reprice_direction: str,
+    reprice_only_active: bool,
+    apply: bool,
+    dsn: Optional[str],
+) -> None:
+    if not apply:
+        raise RuntimeError("live requires --apply to work against MySQL.")
+    if not dsn:
+        raise RuntimeError("--apply requires --dsn")
+
+    ensure_schema_and_seed(dsn)
+
+    conn = _maybe_get_conn(dsn)
+    cur = conn.cursor()
+
+    def refresh_catalog() -> Tuple[Dict[str, float], Dict[str, str], List[str]]:
+        cur.execute("select product_id, price from products where is_active = TRUE")
+        product_rows = cur.fetchall()
+        if not product_rows:
+            raise RuntimeError("No active products available for streaming.")
+        products_map = {str(pid): float(price) for pid, price in product_rows}
+
+        cur.execute("select customer_id, country_code from customers")
+        customer_rows = cur.fetchall()
+        if not customer_rows:
+            raise RuntimeError("No customers available for streaming.")
+        customer_ids_local = [str(row[0]) for row in customer_rows]
+        country_map = {str(row[0]): str(row[1]) for row in customer_rows}
+        return products_map, country_map, customer_ids_local
+
+    product_ids_prices, cust_country, customer_ids = refresh_catalog()
+    last_reprice = time.monotonic() - reprice_cooldown  # allow immediate reprice if triggered
+
+    try:
+        while True:
+            # Optionally insert an order for this tick.
+            if random.random() < eps:
+                order_id = uuid4()
+                cid = random.choice(customer_ids)
+                country = cust_country[cid]
+                order_ts = datetime.utcnow()
+                channel = weighted_choice(CHANNEL_PRIORS)
+                campaign_id = pick_campaign(channel)
+                items = sample_items(product_ids_prices)
+                subtotal = round(sum(li[3] for li in items), 2)
+                tax = round(subtotal * tax_rate_for_country(country), 2)
+                shipping_fee = round(shipping_fee_for_subtotal(subtotal), 2)
+                total_amount = round(subtotal + tax + shipping_fee, 2)
+                status = status_from_total(total_amount)
+
+                cur.execute(
+                    "insert into orders (order_id,customer_id,order_ts,status,currency,subtotal,tax,shipping_fee,total_amount,channel,campaign_id,created_at) "
+                    "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())",
+                    (order_id, cid, order_ts, status, CURRENCY, subtotal, tax, shipping_fee, total_amount, channel, campaign_id),
+                )
+                for pid, qty, unit_price, line_amount in items:
+                    cur.execute(
+                        "insert into order_items (order_id,product_id,qty,unit_price,line_amount) values (%s,%s,%s,%s,%s)",
+                        (order_id, pid, qty, unit_price, line_amount),
+                    )
+                conn.commit()
+                print(f"Inserted order {order_id} ({len(items)} lines) total={total_amount:.2f} {CURRENCY}")
+
+            now = time.monotonic()
+            if (
+                reprice_count > 0
+                and now - last_reprice >= reprice_cooldown
+                and random.random() < reprice_chance
+            ):
+                cmd_reprice(
+                    apply=True,
+                    dsn=dsn,
+                    outfile=None,
+                    pct_min=reprice_pct_min,
+                    pct_max=reprice_pct_max,
+                    direction=reprice_direction,
+                    count=reprice_count,
+                    per_day=None,
+                    backfill_start=None,
+                    backfill_end=None,
+                    only_active=reprice_only_active,
+                    scd2_log_csv=None,
+                )
+                product_ids_prices, cust_country, customer_ids = refresh_catalog()
+                last_reprice = now
+
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("Stopping live mode...")
+    finally:
+        cur.close()
+        conn.close()
+
 # ---------- CLI ----------
 
 def main():
@@ -467,6 +589,16 @@ def main():
     # stream
     p_stream = sub.add_parser("stream", help="Continuously insert orders")
     p_stream.add_argument("--eps", type=float, default=0.2, help="Approx orders per second (0..1 reasonable)")
+    # live
+    p_live = sub.add_parser("live", help="Ensure schema/seed, stream orders, randomly reprice")
+    p_live.add_argument("--eps", type=float, default=0.2, help="Approx orders per second (0..1 reasonable)")
+    p_live.add_argument("--reprice-chance", type=float, default=0.05, help="Chance each second to trigger repricing")
+    p_live.add_argument("--reprice-cooldown", type=float, default=120.0, help="Minimum seconds between repricing runs")
+    p_live.add_argument("--reprice-count", type=int, default=3, help="Number of products to reprice when triggered")
+    p_live.add_argument("--reprice-pct-min", type=float, default=3.0, help="Min %% change for repricing")
+    p_live.add_argument("--reprice-pct-max", type=float, default=15.0, help="Max %% change for repricing")
+    p_live.add_argument("--reprice-direction", choices=["up","down","mixed"], default="mixed", help="Direction for repricing deltas")
+    p_live.add_argument("--reprice-only-active", action="store_true", help="Limit repricing to active products")
 
     args = ap.parse_args()
 
@@ -478,6 +610,19 @@ def main():
         cmd_orders(args.count, args.apply, args.dsn, args.outfile, args.min_lines, args.max_lines, args.backfill_days)
     elif args.cmd == "stream":
         cmd_stream(args.eps, args.apply, args.dsn)
+    elif args.cmd == "live":
+        cmd_live(
+            eps=args.eps,
+            reprice_chance=args.reprice_chance,
+            reprice_cooldown=args.reprice_cooldown,
+            reprice_count=args.reprice_count,
+            reprice_pct_min=args.reprice_pct_min,
+            reprice_pct_max=args.reprice_pct_max,
+            reprice_direction=args.reprice_direction,
+            reprice_only_active=args.reprice_only_active,
+            apply=args.apply,
+            dsn=args.dsn,
+        )
     elif args.cmd == "reprice":
         cmd_reprice(
             apply=args.apply,
