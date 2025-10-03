@@ -28,13 +28,15 @@ Notes:
 
 import argparse
 import csv
+import io
 import math
+import os
 import random
-from dataclasses import dataclass
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-import sys
+from urllib.parse import urlparse
 
 from constants import (
     ALLOC_PRIORS,
@@ -119,11 +121,119 @@ def rows_for_day(day: datetime, daily_budget: float) -> List[List[str]]:
             ])
     return rows
 
+CSV_HEADER = [
+    "date",
+    "channel",
+    "campaign_id",
+    "cost",
+    "impressions",
+    "clicks",
+    "currency",
+]
+
+
 def write_csv(path: Path, rows: List[List[str]]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["date","channel","campaign_id","cost","impressions","clicks","currency"])
+        w.writerow(CSV_HEADER)
         w.writerows(rows)
+
+
+def render_csv(rows: List[List[str]]) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(CSV_HEADER)
+    writer.writerows(rows)
+    return buffer.getvalue()
+
+
+def _build_prefixed_path(prefix: str, filename: str) -> str:
+    normalized = prefix.lstrip("/")
+    if normalized and not normalized.endswith("/"):
+        normalized += "/"
+    return f"{normalized}{filename}" if normalized else filename
+
+
+def upload_to_s3(uri: str, filename: str, payload: bytes) -> str:
+    try:
+        import boto3
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("boto3 is required for S3 uploads") from exc
+
+    parsed = urlparse(uri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Invalid S3 URI: {uri}")
+
+    bucket = parsed.netloc
+    key = _build_prefixed_path(parsed.path, filename)
+    boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=payload, ContentType="text/csv")
+    return f"s3://{bucket}/{key}"
+
+
+def upload_to_gcs(uri: str, filename: str, payload: bytes) -> str:
+    try:
+        from google.cloud import storage
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("google-cloud-storage is required for GCS uploads") from exc
+
+    parsed = urlparse(uri)
+    if parsed.scheme not in {"gs", "gcs"} or not parsed.netloc:
+        raise ValueError(f"Invalid GCS URI: {uri}")
+
+    bucket_name = parsed.netloc
+    object_name = _build_prefixed_path(parsed.path, filename)
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_name)
+    blob.upload_from_string(payload, content_type="text/csv")
+    return f"gs://{bucket_name}/{object_name}"
+
+
+def upload_to_azure(uri: str, filename: str, payload: bytes) -> str:
+    try:
+        from azure.storage.blob import BlobServiceClient
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("azure-storage-blob is required for Azure uploads") from exc
+
+    parsed = urlparse(uri)
+    if parsed.scheme not in {"azure", "az", "azure-blob"}:
+        raise ValueError(f"Invalid Azure Blob URI: {uri}")
+    if not parsed.netloc:
+        raise ValueError("Azure Blob URI must include the storage account name")
+
+    account = parsed.netloc
+    path = parsed.path.lstrip("/")
+    if not path:
+        raise ValueError("Azure Blob URI must include the container name")
+
+    parts = path.split("/", 1)
+    container = parts[0]
+    blob_prefix = parts[1] if len(parts) > 1 else ""
+    blob_name = _build_prefixed_path(blob_prefix, filename)
+
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    if conn_str:
+        service = BlobServiceClient.from_connection_string(conn_str)
+    else:
+        account_url = f"https://{account}.blob.core.windows.net"
+        credential = os.getenv("AZURE_STORAGE_SAS_TOKEN") or os.getenv("AZURE_STORAGE_KEY")
+        service = BlobServiceClient(account_url=account_url, credential=credential)
+
+    container_client = service.get_container_client(container)
+    container_client.upload_blob(name=blob_name, data=payload, overwrite=True, content_type="text/csv")
+    return f"https://{account}.blob.core.windows.net/{container}/{blob_name}"
+
+
+def upload_to_cloud(uri: str, filename: str, payload: bytes) -> str:
+    parsed = urlparse(uri)
+    scheme = parsed.scheme.lower()
+    if scheme == "s3":
+        return upload_to_s3(uri, filename, payload)
+    if scheme in {"gs", "gcs"}:
+        return upload_to_gcs(uri, filename, payload)
+    if scheme in {"azure", "az", "azure-blob"}:
+        return upload_to_azure(uri, filename, payload)
+    raise ValueError(f"Unsupported output URI scheme: {scheme}")
 
 def main():
     ap = argparse.ArgumentParser(description="Generate daily ad spend CSV(s)")
@@ -132,6 +242,14 @@ def main():
     g.add_argument("--start", help="Start date YYYY-MM-DD (inclusive)")
     ap.add_argument("--end", help="End date YYYY-MM-DD (inclusive; required with --start)")
     ap.add_argument("--outdir", type=Path, help="Directory to write files (default: stdout)")
+    ap.add_argument(
+        "--output-uri",
+        help=(
+            "Cloud storage URI prefix for uploads."
+            " Supports s3://bucket/path, gs://bucket/path,"
+            " or azure://account/container/path"
+        ),
+    )
     ap.add_argument("--daily-budget", type=float, default=300.0, help="Total EUR budget per day to allocate")
     ap.add_argument("--seed", type=int, help="Random seed for reproducibility")
     args = ap.parse_args()
@@ -148,17 +266,24 @@ def main():
 
     for day in days:
         rows = rows_for_day(day, args.daily_budget)
+        filename = f"ad_spend_{day.strftime('%Y-%m-%d')}.csv"
+        csv_payload: Optional[str] = None
+
         if args.outdir:
             args.outdir.mkdir(parents=True, exist_ok=True)
-            path = args.outdir / f"ad_spend_{day.strftime('%Y-%m-%d')}.csv"
+            path = args.outdir / filename
             write_csv(path, rows)
             print(f"Wrote {path}")
-        else:
+        if args.output_uri:
+            if csv_payload is None:
+                csv_payload = render_csv(rows)
+            destination = upload_to_cloud(args.output_uri, filename, csv_payload.encode("utf-8"))
+            print(f"Uploaded to {destination}")
+        elif not args.outdir:
             # stdout single file
-            w = csv.writer(sys.stdout)
-            # header once per day (since often used one day at a time on stdout)
-            print("date,channel,campaign_id,cost,impressions,clicks,currency")
-            w.writerows(rows)
+            if csv_payload is None:
+                csv_payload = render_csv(rows)
+            sys.stdout.write(csv_payload)
 
 if __name__ == "__main__":
     main()
