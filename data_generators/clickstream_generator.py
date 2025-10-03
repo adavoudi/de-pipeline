@@ -2,8 +2,8 @@
 """
 Clickstream Events Generator
 
-Generates realistic clickstream events to stdout, a JSONL file, or a Kafka topic.
-Schema (one topic): clickstream_events
+Generates realistic clickstream events to stdout, a JSONL file, or an HTTP(S) endpoint.
+Schema (one event type): clickstream_events
 
 {
   "event_id": "uuid",
@@ -32,6 +32,8 @@ import random
 import sys
 import time
 import uuid
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
@@ -56,14 +58,6 @@ CUSTOMER_RECORDS = generate_customers(CUSTOMER_COUNT)
 CUSTOMER_IDS = [c["customer_id"] for c in CUSTOMER_RECORDS]
 PRODUCT_CATALOG = generate_products(PRODUCT_COUNT)
 PRODUCT_IDS = [p["product_id"] for p in PRODUCT_CATALOG]
-
-# Optional Kafka support (lazy import so the script works without it)
-def _maybe_load_kafka():
-    try:
-        from confluent_kafka import Producer  # type: ignore
-        return Producer
-    except Exception:
-        return None
 
 # ---------- Realistic reference data ----------
 # Inter-event timing (to make timestamps look real)
@@ -154,23 +148,27 @@ def emit_file(path: Path, events: List[Dict]) -> None:
         for e in events:
             f.write(json.dumps(e, separators=(",", ":"), ensure_ascii=False) + "\n")
 
-def emit_kafka(brokers: str, topic: str, events: List[Dict]) -> None:
-    Producer = _maybe_load_kafka()
-    if Producer is None:
-        raise RuntimeError("Kafka output requested but confluent-kafka is not installed.")
-    p = Producer({"bootstrap.servers": brokers, "compression.type": "zstd"})
+def emit_http(endpoint: str, events: List[Dict]) -> None:
+    headers = {"Content-Type": "application/json"}
     for e in events:
-        p.produce(topic, json.dumps(e, separators=(",", ":"), ensure_ascii=False).encode("utf-8"), key=e["event_id"])
-    p.flush()
+        payload = json.dumps(e, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(endpoint, data=payload, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10):
+                pass
+        except urllib.error.HTTPError as exc:
+            sys.stderr.write(f"HTTP error {exc.code} while sending event {e['event_id']}: {exc.reason}\n")
+        except urllib.error.URLError as exc:
+            sys.stderr.write(f"Failed to reach {endpoint} for event {e['event_id']}: {exc.reason}\n")
 
 # ---------- Main loop ----------
 
-def generate_events_stream(total_events: Optional[int], eps: float, output, kafka_cfg, jitter: float) -> None:
+def generate_events_stream(total_events: Optional[int], eps: float, output, http_endpoint: Optional[str], jitter: float) -> None:
     """
     total_events: stop after this many events (None -> run forever)
     eps: events per second target (global)
     output: None -> stdout, Path -> JSONL file
-    kafka_cfg: (brokers, topic) or None
+    http_endpoint: URL to POST events to, if provided
     jitter: +/- fraction to vary eps each second (e.g., 0.25 = ±25%)
     """
     random.seed(DEFAULT_SEED)
@@ -200,8 +198,8 @@ def generate_events_stream(total_events: Optional[int], eps: float, output, kafk
             batch = batch[: max(0, total_events - emitted)]
 
         # Emit
-        if kafka_cfg is not None:
-            emit_kafka(kafka_cfg[0], kafka_cfg[1], batch)
+        if http_endpoint is not None:
+            emit_http(http_endpoint, batch)
         elif output is None:
             emit_stdout(batch)
         else:
@@ -220,8 +218,7 @@ def parse_args():
     g_out = ap.add_mutually_exclusive_group()
     g_out.add_argument("--outfile", type=Path, help="Write JSONL to this file (appends)")
     g_out.add_argument("--stdout", action="store_true", help="Write to stdout (default)")
-    ap.add_argument("--kafka-brokers", help="Kafka bootstrap servers, e.g. localhost:9092")
-    ap.add_argument("--kafka-topic", default="clickstream_events", help="Kafka topic name (default: clickstream_events)")
+    ap.add_argument("--http-endpoint", help="HTTP(S) endpoint to POST events to")
     ap.add_argument("--events", type=int, help="Total number of events to emit (default: run forever)")
     ap.add_argument("--eps", type=float, default=20.0, help="Target events per second (default: 20)")
     ap.add_argument("--jitter", type=float, default=0.25, help="Per-second EPS jitter fraction (default: 0.25)")
@@ -230,11 +227,9 @@ def parse_args():
 def main():
     args = parse_args()
     output = None
-    kafka_cfg = None
+    http_endpoint = args.http_endpoint
 
-    if args.kafka_brokers:
-        kafka_cfg = (args.kafka_brokers, args.kafka_topic)
-    elif args.outfile:
+    if args.outfile and not http_endpoint:
         output = args.outfile
     else:
         output = None  # stdout
@@ -244,7 +239,7 @@ def main():
             total_events=args.events,
             eps=args.eps,
             output=output,
-            kafka_cfg=kafka_cfg,
+            http_endpoint=http_endpoint,
             jitter=args.jitter,
         )
     except KeyboardInterrupt:
